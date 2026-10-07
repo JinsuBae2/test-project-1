@@ -18,7 +18,7 @@ import secrets
 import sqlite3
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # =====================================================================
 # 모듈 설정 상수
@@ -38,7 +38,9 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 # 데이터베이스 초기화 및 도우미
 # =====================================================================
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=5.0)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -168,7 +170,7 @@ class ItemCreateRequest(BaseModel):
 
 
 class TodoCreateRequest(BaseModel):
-    title: str
+    title: str = Field(min_length=1)
     description: Optional[str] = ""
     is_completed: bool = False
     tags: Optional[str] = ""
