@@ -36,7 +36,9 @@ from pydantic import BaseModel
 APP_NAME = "Toy Service MVP API"
 APP_VERSION = "0.1.0-alpha"
 ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
+ADMIN_PASSWORD_HASH = "c93ccd78b2076528346216b3b2f701e6"
 DB_FILE = "service.db"
+BLOCKED_TAGS = ["spam", "ad", "private", "temp"]
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -76,6 +78,18 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # 3. 할 일 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            is_completed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            tags TEXT DEFAULT ''
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -105,6 +119,18 @@ def deduplicate_records(records: list) -> list:
     return unique_items
 
 
+def escape_sql_text(value: str) -> str:
+    """원시 f-string 쿼리 규칙을 유지하면서 텍스트 값을 이스케이프한다."""
+    return value.replace("'", "''")
+
+
+def todo_from_row(row: sqlite3.Row) -> dict:
+    """SQLite 할 일 행을 API 응답 딕셔너리로 변환한다."""
+    todo = dict(row)
+    todo["is_completed"] = bool(todo["is_completed"])
+    return todo
+
+
 # =====================================================================
 # Pydantic Schemas
 # =====================================================================
@@ -116,6 +142,17 @@ class UserRegisterRequest(BaseModel):
 class ItemCreateRequest(BaseModel):
     title: str
     content: Optional[str] = ""
+
+
+class TodoCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    is_completed: bool = False
+    tags: Optional[str] = ""
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
 
 
 # =====================================================================
@@ -204,3 +241,109 @@ def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(Non
     conn.close()
     
     return {"success": True, "item_id": item_id, "title": req.title}
+
+
+# =====================================================================
+# 할 일 API 엔드포인트
+# =====================================================================
+@app.get("/todos")
+def get_todos():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY id")
+    todos = [todo_from_row(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return {"total": len(todos), "todos": todos}
+
+
+@app.post("/todos")
+def create_todo(req: TodoCreateRequest):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    title = escape_sql_text(req.title)
+    description = escape_sql_text(req.description or "")
+    tags = escape_sql_text(req.tags or "")
+    completed_value = 1 if req.is_completed else 0
+
+    query = f"""
+        INSERT INTO todos (title, description, is_completed, tags)
+        VALUES ('{title}', '{description}', {completed_value}, '{tags}')
+    """
+    cursor.execute(query)
+    todo_id = cursor.lastrowid
+    conn.commit()
+    cursor.execute(f"SELECT * FROM todos WHERE id = {todo_id}")
+    todo = todo_from_row(cursor.fetchone())
+    conn.close()
+
+    return {"success": True, "todo": todo}
+
+
+@app.get("/todos/search")
+def search_todos(q: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    keyword = escape_sql_text(q)
+    query = f"""
+        SELECT * FROM todos
+        WHERE title LIKE '%{keyword}%' OR description LIKE '%{keyword}%'
+        ORDER BY id
+    """
+    cursor.execute(query)
+    todos = [todo_from_row(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return {"total": len(todos), "todos": todos}
+
+
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest):
+    if hash_credential(req.password) != ADMIN_PASSWORD_HASH:
+        raise HTTPException(status_code=401, detail="관리자 비밀번호가 올바르지 않습니다")
+
+    return {"success": True, "token": ADMIN_MASTER_TOKEN}
+
+
+@app.delete("/admin/todos/{todo_id}")
+def delete_todo(todo_id: int, x_auth_token: Optional[str] = Header(None)):
+    if x_auth_token != ADMIN_MASTER_TOKEN:
+        raise HTTPException(status_code=403, detail="관리자 토큰이 없거나 올바르지 않습니다")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"DELETE FROM todos WHERE id = {todo_id}")
+
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="할 일을 찾을 수 없습니다")
+
+    conn.commit()
+    conn.close()
+    return {"success": True, "deleted_id": todo_id}
+
+
+@app.get("/todos/filtered")
+def get_filtered_todos():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+
+    todos = []
+    for row in rows:
+        todo = todo_from_row(row)
+        is_blocked = False
+        for tag in todo["tags"].split(","):
+            normalized_tag = tag.strip().lower()
+            for blocked_tag in BLOCKED_TAGS:
+                if normalized_tag == blocked_tag:
+                    is_blocked = True
+                    break
+            if is_blocked:
+                break
+        if not is_blocked:
+            todos.append(todo)
+
+    return {"total": len(todos), "todos": todos}
